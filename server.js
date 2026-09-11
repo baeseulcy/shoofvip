@@ -8,7 +8,7 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/
 
 const manifest = {
   id: 'com.naevistv.shoofvip',
-  version: '1.1.0',
+  version: '1.2.0',
   name: 'ShoofVIP',
   description: 'Search ShoofVIP directly and provide its episodes and streams.',
   resources: [
@@ -77,6 +77,19 @@ function dec(s) { return Buffer.from(String(s), 'base64url').toString('utf8'); }
 function idFor(url) { return 'shoof:' + enc(url); }
 function urlFromId(id) { return dec(id.slice('shoof:'.length)); }
 function unique(arr) { return [...new Set(arr.filter(Boolean))]; }
+
+function uniqueStreams(arr) {
+  const seen = new Set();
+  const out = [];
+  for (const s of (arr || [])) {
+    if (!s) continue;
+    const key = s.url || s.externalUrl;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(s);
+  }
+  return out;
+}
 
 function linksFrom(html, base) {
   const out = [];
