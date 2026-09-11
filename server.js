@@ -8,7 +8,7 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/
 
 const manifest = {
   id: 'com.naevistv.shoofvip',
-  version: '1.0.0',
+  version: '1.1.0',
   name: 'ShoofVIP',
   description: 'Search ShoofVIP directly and provide its episodes and streams.',
   resources: [
@@ -270,32 +270,124 @@ function extractDirect(html, pageUrl) {
   return { streams: out, iframes: unique(iframes) };
 }
 
-async function resolveEmbed(iframeUrl, referer, depth = 0) {
+function serverNameFromHost(host) {
+  const h = String(host || '').toLowerCase();
+  if (h.includes('cdnplus')) return 'CDNPlus';
+  if (h.includes('mp4plus')) return 'MP4Plus';
+  if (h.includes('anafast')) return 'AnaFast';
+  if (h.includes('vidoba')) return 'Vidoba';
+  if (h.includes('vidspeed')) return 'VidSpeed';
+  if (h.includes('ok.ru')) return 'OK';
+  return 'ShoofVIP Server';
+}
+
+function addExternal(out, url, title, referer) {
+  if (!url) return;
+  out.push({
+    name: 'ShoofVIP',
+    title,
+    externalUrl: url,
+    behaviorHints: { notWebReady: true },
+    headers: { Referer: referer || SITE + '/', 'User-Agent': UA }
+  });
+}
+
+function anaplayerServerUrls(iframeUrl, html) {
   const out = [];
-  if (!iframeUrl || depth > 2) return out;
-  const page = await request(iframeUrl).catch(() => null);
-  if (!page) return out;
-  const x = extractDirect(page.html, iframeUrl);
-  out.push(...x.streams);
+  const seen = new Set();
+  const add = (u, name) => {
+    if (!u || seen.has(u)) return;
+    seen.add(u);
+    out.push({ url: u, name: name || serverNameFromHost(new URL(u).hostname) });
+  };
 
-  const cfg = /(?:file|src|source|hls|playlist)\s*[:=]\s*["'](https?:\/\/[^"']+)["']/gi;
-  let m;
-  while ((m = cfg.exec(page.html))) {
-    if (/\.(?:m3u8|mp4)(?:\?|$)/i.test(m[1])) {
-      out.push({ name:'ShoofVIP', title:'ShoofVIP Player', url:m[1], quality:'HD', headers:{ Referer:iframeUrl, 'User-Agent':UA } });
+  // AnaPlayer uses ?serv=0..N. Discover the base path from the iframe itself.
+  try {
+    const u = new URL(iframeUrl);
+    u.search = '';
+    for (let i = 0; i < 8; i++) {
+      const x = new URL(u.href);
+      x.searchParams.set('serv', String(i));
+      add(x.href, `AnaPlayer Server ${i + 1}`);
     }
-  }
+  } catch (_) {}
 
-  for (const nested of x.iframes.slice(0, 4)) {
-    if (nested === iframeUrl) continue;
-    out.push(...await resolveEmbed(nested, iframeUrl, depth + 1));
+  // Also capture any explicit AnaPlayer server links present in the page.
+  const re = /href=["']([^"']*anaplayer[^"']*(?:serv=\d+)[^"']*)["']/gi;
+  let m;
+  while ((m = re.exec(html || ''))) add(abs(decodeHtml(m[1]), iframeUrl));
+  return out;
+}
+
+async function resolveAnaPlayer(iframeUrl, referer) {
+  const out = [];
+  const basePage = await request(iframeUrl).catch(() => null);
+  if (!basePage) return out;
+
+  const servers = anaplayerServerUrls(iframeUrl, basePage.html);
+  // First resolve each selected server. This is the important part missing in v1.
+  for (const srv of servers) {
+    const page = await request(srv.url).catch(() => null);
+    if (!page) continue;
+
+    const x = extractDirect(page.html, srv.url);
+    for (const st of x.streams) {
+      st.title = srv.name + (st.title ? ' • ' + st.title : '');
+      st.headers = { ...(st.headers || {}), Referer: srv.url, 'User-Agent': UA };
+      out.push(st);
+    }
+
+    // The selected AnaPlayer page normally contains the actual provider iframe.
+    for (const nested of x.iframes.slice(0, 3)) {
+      const nestedPage = await request(nested).catch(() => null);
+      if (!nestedPage) {
+        // If the provider blocks server-side fetching, at least expose the working player URL.
+        addExternal(out, nested, srv.name, srv.url);
+        continue;
+      }
+      const nx = extractDirect(nestedPage.html, nested);
+      for (const st of nx.streams) {
+        st.title = srv.name + (st.title ? ' • ' + st.title : '');
+        st.headers = { ...(st.headers || {}), Referer: nested, 'User-Agent': UA };
+        out.push(st);
+      }
+      if (!nx.streams.length) addExternal(out, nested, srv.name, srv.url);
+    }
+
+    // If extraction failed completely, returning the selected AnaPlayer server is
+    // still useful and prevents Nuvio from reporting "No streams found".
+    if (!x.streams.length && !x.iframes.length) {
+      addExternal(out, srv.url, srv.name, iframeUrl);
+    }
   }
   return uniqueStreams(out);
 }
 
-function uniqueStreams(arr) {
-  const seen = new Set();
-  return arr.filter(x => x && x.url && !seen.has(x.url) && seen.add(x.url));
+async function resolveEmbed(iframeUrl, referer, depth = 0) {
+  const out = [];
+  if (!iframeUrl || depth > 2) return out;
+
+  // ShoofVIP currently routes its episode iframe through AnaPlayer.
+  if (/anaplayer\.online/i.test(iframeUrl)) {
+    return resolveAnaPlayer(iframeUrl, referer);
+  }
+
+  const page = await request(iframeUrl).catch(() => null);
+  if (!page) {
+    addExternal(out, iframeUrl, serverNameFromHost(new URL(iframeUrl).hostname), referer);
+    return out;
+  }
+
+  const x = extractDirect(page.html, iframeUrl);
+  out.push(...x.streams);
+  if (!x.streams.length && !x.iframes.length) {
+    addExternal(out, iframeUrl, serverNameFromHost(new URL(iframeUrl).hostname), referer);
+  }
+
+  for (const nested of x.iframes.slice(0, 4)) {
+    out.push(...await resolveEmbed(nested, iframeUrl, depth + 1));
+  }
+  return uniqueStreams(out);
 }
 
 builder.defineStreamHandler(async ({ id }) => {
